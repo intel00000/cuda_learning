@@ -33,7 +33,18 @@ private:
     std::chrono::high_resolution_clock::time_point start;
 };
 
-// CUDA Kernel for matrix multiplication
+/*
+ * CUDA kernel to perform matrix multiplication C = A * B
+ * where A is of size M x K, B is of size K x N, and C is of size M x N
+ *
+ * Parameters:
+ *  A - pointer to matrix A in device memory
+ *  B - pointer to matrix B in device memory
+ *  C - pointer to matrix C in device memory
+ * M_ - number of rows in matrix A and C
+ * K_ - number of columns in matrix A and rows in matrix B
+ * N_ - number of columns in matrix B and C
+ */
 __global__ void matrixMultiplyGPU(float *A, float *B, float *C, int M_, int K_, int N_)
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y; // Row index
@@ -157,7 +168,8 @@ int main(int argc, char **argv)
     bool isEqual = true;
     for (int i = 0; i < M * N; i++)
     {
-        if (int(h_C_CPU[i]) != int(h_C_GPU[i]))
+        float diff = h_C_CPU[i] - h_C_GPU[i];
+        if (diff < -1e-5 || diff > 1e-5)
         {
             isEqual = false;
             std::cout << "Mismatch at index " << i << ": CPU = " << h_C_CPU[i] << ", GPU = " << h_C_GPU[i] << std::endl;
