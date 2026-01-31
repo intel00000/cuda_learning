@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <curand_kernel.h>
 #include <cooperative_groups.h>
@@ -7,6 +8,7 @@
 namespace cg = cooperative_groups;
 
 #include <functional>
+#include <iomanip>
 #include <iostream>
 
 // macro to wrap CUDA and CUBLAS calls and check for errors
@@ -52,6 +54,15 @@ static int arg_parse_int(int argc, char **argv, const char *key, int def)
     return def;
 }
 
+static void print_header(std::string_view title, int width = 50)
+{
+    int title_len = (int)title.size();
+    int pad_total = width - title_len - 2;
+    int pad_left = pad_total / 2;
+    int pad_right = pad_total - pad_left;
+    std::cout << std::string(pad_left, '=') << " " << title << " " << std::string(pad_right, '=') << "\n";
+}
+
 // structure to hold benchmark results
 struct BenchResult
 {
@@ -65,10 +76,10 @@ struct BenchResult
 // we have 2 * M * N * K floating point operations
 // this is considering the multiply and add as separate operations
 // though it can also be thought as fused multiply-add (FMA)
-static inline double gflops_from_ms(int M, int K, int N, float ms)
+static inline double tflops_from_ms(int M, int K, int N, float ms)
 {
     double operations = 2.0 * (double)M * (double)N * (double)K;
-    return (operations / 1e9) / ((double)ms / 1e3);
+    return (operations / 1e12) / ((double)ms / 1e3);
 }
 
 // use cudaEvent to measure elapsed time
@@ -83,6 +94,7 @@ static inline float time_ms_events(cudaStream_t stream,
     // warm up
     for (int i = 0; i < warmup_iters; ++i)
         func();
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
     CHECK_CUDA_ERROR(cudaEventRecord(start, stream));
     for (int i = 0; i < timed_iters; ++i)
@@ -184,6 +196,7 @@ static inline void fill_random_device_array(T *d_array, size_t n, cudaStream_t s
         grid = minGridSize * 2; // Cap grid size
 
     generate_random_kernel<T><<<grid, blockSize, 0, stream>>>(d_array, n, seed);
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     CHECK_CUDA_ERROR(cudaGetLastError());
 }
 
@@ -297,3 +310,101 @@ CompareResult compare_device_arrays(const T *ref, const T *test, size_t n, cudaS
 
     return result;
 }
+
+template <typename InputT, typename OutputT = InputT>
+class Bench
+{
+public:
+    Bench(int M, int N, int K, size_t ws_size) : M_(M), N_(N), K_(K), ws_size_(ws_size)
+    {
+        CHECK_CUDA_ERROR(cudaStreamCreate(&stream_));
+        CHECK_CUBLAS_ERROR(cublasLtCreate(&lt_));
+
+        a_elems_ = (size_t)M_ * (size_t)K_;
+        b_elems_ = (size_t)K_ * (size_t)N_;
+        c_elems_ = (size_t)M_ * (size_t)N_;
+
+        CHECK_CUDA_ERROR(cudaMalloc(&dA_, a_elems_ * sizeof(InputT)));
+        CHECK_CUDA_ERROR(cudaMalloc(&dB_, b_elems_ * sizeof(InputT)));
+        CHECK_CUDA_ERROR(cudaMalloc(&dC_, c_elems_ * sizeof(OutputT)));
+        CHECK_CUDA_ERROR(cudaMalloc(&dC_ref_, c_elems_ * sizeof(OutputT)));
+        CHECK_CUDA_ERROR(cudaMalloc(&ws_, ws_size_));
+
+        fill_random_device_array<InputT>(dA_, a_elems_, stream_, 1ULL);
+        fill_random_device_array<InputT>(dB_, b_elems_, stream_, 2ULL);
+        reset_C();
+    }
+
+    ~Bench()
+    {
+        cudaFree(dA_);
+        cudaFree(dB_);
+        cudaFree(dC_);
+        cudaFree(dC_ref_);
+        cudaFree(ws_);
+        cublasLtDestroy(lt_);
+        cudaStreamDestroy(stream_);
+    }
+
+    void reset_C()
+    {
+        fill_random_device_array<OutputT>(dC_, c_elems_, stream_, 3ULL);
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(dC_ref_, dC_, c_elems_ * sizeof(OutputT),
+                                         cudaMemcpyDeviceToDevice, stream_));
+        CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    }
+
+    // Benchmark kernel and baseline back-to-back with identical initialization.
+    template <typename KernelFn, typename BaselineFn>
+    void run_pair(const char *tag, int warmup, int iters, KernelFn kernel_fn, BaselineFn baseline_fn)
+    {
+        reset_C();
+        float k_ms = time_ms_events(stream_, warmup, iters, kernel_fn);
+        float k_tflops = tflops_from_ms(M_, K_, N_, k_ms);
+        float b_ms = time_ms_events(stream_, warmup, iters, baseline_fn);
+        float b_tflops = tflops_from_ms(M_, K_, N_, b_ms);
+
+        print_header(tag);
+        auto pct = (b_ms / k_ms) * 100.0f;
+        std::cout << std::left << std::setw(10) << "Kernel:"
+                  << std::right << " ms=" << std::setw(6) << k_ms
+                  << "  TFLOPS=" << std::setw(8) << k_tflops << "\n";
+        std::cout << std::left << std::setw(10) << "Baseline:"
+                  << std::right << " ms=" << std::setw(6) << b_ms
+                  << "  TFLOPS=" << std::setw(8) << b_tflops
+                  << "  percent=" << std::setw(6) << pct << "%\n";
+
+        // Verify kernel vs baseline
+        float rel_tol = std::is_same_v<OutputT, half> ? 1e-2f : 1e-4f;
+        CompareResult cmp = compare_device_arrays<OutputT>(dC_ref_, dC_, c_elems_, stream_, rel_tol);
+        std::cout
+            << std::left << std::setw(10) << "Verify:"
+            << std::right << " max_abs=" << std::setw(6) << cmp.max_abs_err
+            << "  max_rel=" << std::setw(6) << cmp.max_rel_err
+            << "  mismatches=" << cmp.num_mismatches << "\n";
+    }
+
+    // Accessors
+    cublasLtHandle_t lt() const { return lt_; }
+    cudaStream_t stream() const { return stream_; }
+    InputT *A() const { return dA_; }
+    InputT *B() const { return dB_; }
+    OutputT *C() const { return dC_; }
+    OutputT *C_ref() const { return dC_ref_; }
+    void *ws() const { return ws_; }
+    size_t ws_size() const { return ws_size_; }
+    int M() const { return M_; }
+    int N() const { return N_; }
+    int K() const { return K_; }
+
+private:
+    int M_, N_, K_;
+    size_t ws_size_, a_elems_, b_elems_, c_elems_;
+    cudaStream_t stream_{};
+    cublasLtHandle_t lt_{};
+    InputT *dA_{nullptr};
+    InputT *dB_{nullptr};
+    OutputT *dC_{nullptr};
+    OutputT *dC_ref_{nullptr};
+    void *ws_{nullptr};
+};
