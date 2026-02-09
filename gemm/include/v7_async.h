@@ -24,7 +24,7 @@ template <>
 struct WmmaConfig<float>
 {
     static constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 8;
-    static constexpr int BM = 128, BN = 128, BK = 8;
+    static constexpr int BM = 128, BN = 128, BK = 16;
     static constexpr int WM = 64, WN = 64;
     static constexpr int SKEW_A = 4, SKEW_B = 4;
     using InputType = precision::tf32;
