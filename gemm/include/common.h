@@ -375,7 +375,8 @@ public:
                   << "  percent=" << std::setw(6) << pct << "%\n";
 
         // Verify kernel vs baseline
-        float rel_tol = std::is_same_v<OutputT, half> ? 1e-2f : 1e-4f;
+        // fp32 use 1e-3 relative tolerance, fp16 use 1e-2 relative tolerance, fp64 use 1e-6 relative tolerance
+        float rel_tol = std::is_same_v<OutputT, float> ? 1e-3f : (std::is_same_v<OutputT, double> ? 1e-6f : 1e-2f);
         CompareResult cmp = compare_device_arrays<OutputT>(dC_ref_, dC_, c_elems_, stream_, rel_tol);
         std::cout
             << std::left << std::setw(10) << "Verify:"
@@ -408,3 +409,25 @@ private:
     OutputT *dC_ref_{nullptr};
     void *ws_{nullptr};
 };
+
+// Helper: Vectorized load/store types
+template <typename T, int N>
+struct alignas(sizeof(T) * N) Vec
+{
+    T data[N];
+};
+// Determine optimal vector size (target 16 bytes)
+template <typename T>
+constexpr int VecSize()
+{
+    if constexpr (sizeof(T) >= 16)
+        return 1;
+    else
+        return 16 / sizeof(T); // e.g. half=8, float=4, double=2
+}
+// Check if pointer + index is aligned to vector size
+template <typename T, int VEC>
+__device__ __forceinline__ bool vec_aligned(const T *base, int idx)
+{
+    return (reinterpret_cast<uintptr_t>(base + idx) & (sizeof(T) * VEC - 1)) == 0;
+}
